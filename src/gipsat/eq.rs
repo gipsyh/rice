@@ -6,6 +6,7 @@ use std::mem::take;
 #[derive(Clone)]
 pub struct Eqc {
     eq: LitMap<Lit>,
+    dirty: bool,
 }
 
 impl Eqc {
@@ -39,6 +40,7 @@ impl Eqc {
         }
         self.eq[yp] = xp;
         self.eq[!yp] = !xp;
+        self.dirty = true;
     }
 }
 
@@ -48,7 +50,7 @@ impl Default for Eqc {
         eq.reserve(Var::CONST);
         eq[Lit::TRUE] = Lit::TRUE;
         eq[Lit::FALSE] = Lit::FALSE;
-        Self { eq }
+        Self { eq, dirty: false }
     }
 }
 
@@ -83,8 +85,14 @@ impl DagCnfSolver {
         let learnt = take(&mut self.cdb.learnt);
         let learnt = self.clean_eq_inner(learnt, ClauseKind::Learnt);
         self.cdb.learnt.extend(learnt);
-        let trans = take(&mut self.cdb.trans);
-        let trans = self.clean_eq_inner(trans, ClauseKind::Trans);
-        self.cdb.trans.extend(trans);
+        // Transition clauses are otherwise immutable. Only rescan them when
+        // a new equivalence was proved; learned/lemma clauses can be new even
+        // when the equivalence map has not changed.
+        if self.eqc.dirty {
+            self.eqc.dirty = false;
+            let trans = take(&mut self.cdb.trans);
+            let trans = self.clean_eq_inner(trans, ClauseKind::Trans);
+            self.cdb.trans.extend(trans);
+        }
     }
 }

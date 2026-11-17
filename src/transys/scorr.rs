@@ -14,10 +14,12 @@ pub struct Scorr {
     init_slv: DagCnfSolver,
     ind_slv: DagCnfSolver,
     cfg: PreprocConfig,
+    start: Instant,
 }
 
 impl Scorr {
     pub fn new(ts: Transys, cfg: &PreprocConfig, rst: Restore) -> Self {
+        let start = Instant::now();
         let mut ind_slv = DagCnfSolver::new(&ts.rel);
         for c in ts.constraint.iter() {
             ind_slv.add_clause(&[*c]);
@@ -33,6 +35,7 @@ impl Scorr {
             ind_slv,
             init_slv,
             cfg: cfg.clone(),
+            start,
         }
     }
 
@@ -67,10 +70,21 @@ impl Scorr {
     pub fn scorr(mut self) -> (Transys, Restore) {
         let start = Instant::now();
         let init = self.ts.init_simulation(1);
+        info!(
+            "scorr profile: setup {:.3}s, init {:.3}s, {} states",
+            self.start.elapsed().as_secs_f64() - start.elapsed().as_secs_f64(),
+            start.elapsed().as_secs_f64(),
+            init.bv_len()
+        );
         if init.bv_len() == 0 {
             return (self.ts, self.rst);
         }
         let mut rt = self.ts.rt_simulation(&init, 10);
+        info!(
+            "scorr profile: simulations {:.3}s, {} successors",
+            start.elapsed().as_secs_f64(),
+            rt.bv_len()
+        );
         debug!(
             "scorr: init simulation size: {}, rt simulation size: {}",
             init.bv_len(),
@@ -97,6 +111,12 @@ impl Scorr {
             }
         }
         let mut scorr = VarLMap::new();
+        info!(
+            "scorr profile: candidates {:.3}s, {} classes, max class {}",
+            start.elapsed().as_secs_f64(),
+            cand.len(),
+            cand.values().map(|c| c.len()).max().unwrap_or(0)
+        );
         // for eqc in cand.values() {
         //     if eqc.len() > 200 {
         //         dbg!(eqc.len());
@@ -170,6 +190,12 @@ impl Scorr {
         self.ts.replace(&scorr, &mut self.rst);
         self.ts.simplify(&mut self.rst);
         info!("scorr: simplified ts: {}", self.ts.statistic());
+        info!(
+            "scorr profile: total {:.3}s; init solves {}, induction solves {}",
+            self.start.elapsed().as_secs_f64(),
+            self.init_slv.statistic().num_solve,
+            self.ind_slv.statistic().num_solve
+        );
         (self.ts, self.rst)
     }
 }

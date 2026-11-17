@@ -155,7 +155,16 @@ impl Transys {
             slv.add_clause(&block);
         }
         slv.cfg.phase_saving = false;
-        let domain: Vec<_> = self.next.values().map(|l| l.var()).collect();
+        // Only read successors of the observed registers. The solver expands
+        // these roots to their dependency closure; add_clause also keeps the
+        // cones of permanent constraints and blocking clauses in its domain.
+        let mut domain: Vec<_> = consider
+            .iter()
+            .flat_map(|&v| [v, self.next(v.lit()).var()])
+            .chain(self.constraint().map(|l| l.var()))
+            .collect();
+        domain.sort_unstable();
+        domain.dedup();
         let mut simulate = Simulate {
             ts: self,
             sim,
@@ -192,5 +201,121 @@ impl Transys {
             }
         }
         simulate.sim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logicrs::Lit;
+    use std::collections::{BTreeSet, VecDeque};
+
+    fn check_projected_successors(ts: &Transys, initial: &[(Var, bool)]) {
+        let mut init = VarBitVec::new();
+        init.reserve(ts.max_var());
+        init[Var::CONST].push(false);
+        for &(v, value) in initial {
+            init[v].push(value);
+        }
+        // Enumerate the small projected transition graph with an independent
+        // full-CNF solver, including constraints outside the observed cones.
+        let mut reference = cadical::CaDiCaL::new();
+        ts.load_trans(&mut reference, true);
+        let first: Vec<_> = initial.iter().map(|&(_, value)| value).collect();
+        let mut reached = BTreeSet::from([first.clone()]);
+        let mut queue = VecDeque::from([first.clone()]);
+        while let Some(source) = queue.pop_front() {
+            for bits in 0..1usize << initial.len() {
+                let target: Vec<_> = (0..initial.len()).map(|i| bits & (1 << i) != 0).collect();
+                if reached.contains(&target) {
+                    continue;
+                }
+                let mut assignment = LitVec::new();
+                for (i, &(v, _)) in initial.iter().enumerate() {
+                    assignment.push(Lit::new(v, source[i]));
+                    assignment.push(ts.next(v.lit()).not_if(!target[i]));
+                }
+                if reference.solve(&assignment) {
+                    reached.insert(target.clone());
+                    queue.push_back(target);
+                }
+            }
+        }
+        reached.remove(&first);
+        let sim = ts.rt_simulation(&init, 1);
+        let actual: BTreeSet<Vec<_>> = (0..sim.bv_len())
+            .map(|i| initial.iter().map(|&(v, _)| sim[v].get(i)).collect())
+            .collect();
+        assert_eq!(
+            actual.len(),
+            sim.bv_len(),
+            "blocking must prevent duplicate samples"
+        );
+        assert_eq!(actual, reached);
+        for v in ts.latch() {
+            if !initial.iter().any(|&(observed, _)| observed == v) {
+                assert!(sim[v].is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn retains_constraints_outside_the_observed_next_cones() {
+        let mut ts = Transys::default();
+        let a = ts.new_var();
+        let b = ts.new_var();
+        let x = ts.new_var();
+        let y = ts.new_var();
+        let hidden = ts.new_var();
+        ts.input = vec![a, b];
+        ts.add_latch(x, Some(Lit::FALSE), a.lit());
+        ts.add_latch(y, Some(Lit::FALSE), b.lit());
+        ts.add_latch(hidden, None, !hidden.lit());
+        let left = ts.rel.new_or([!a.lit(), hidden.lit()]);
+        let right = ts.rel.new_or([!hidden.lit(), !b.lit()]);
+        ts.constraint.extend([left, right]);
+        // The unobserved hidden register connects the constraints, ruling out
+        // next(x) = next(y) = true even though their own cones are disjoint.
+        check_projected_successors(&ts, &[(x, false), (y, false)]);
+    }
+
+    #[test]
+    fn retains_current_state_dependencies_across_recursive_samples() {
+        let mut ts = Transys::default();
+        let input = ts.new_var();
+        let x = ts.new_var();
+        let y = ts.new_var();
+        ts.input.push(input);
+        let yn = ts.rel.new_xor(x.lit(), input.lit());
+        ts.add_latch(x, Some(Lit::FALSE), !x.lit());
+        ts.add_latch(y, Some(Lit::FALSE), yn);
+        for _ in 0..16 {
+            let hidden = ts.new_var();
+            let next = ts.rel.new_xor(hidden.lit(), input.lit());
+            ts.add_latch(hidden, None, next);
+        }
+        check_projected_successors(&ts, &[(x, false), (y, false)]);
+    }
+
+    #[test]
+    fn blocks_shared_inverted_and_constant_successors() {
+        let mut ts = Transys::default();
+        let input = ts.new_var();
+        let x = ts.new_var();
+        let y = ts.new_var();
+        let z = ts.new_var();
+        ts.input.push(input);
+        ts.add_latch(x, Some(Lit::FALSE), input.lit());
+        ts.add_latch(y, Some(Lit::FALSE), !input.lit());
+        ts.add_latch(z, Some(Lit::TRUE), Lit::TRUE);
+        check_projected_successors(&ts, &[(x, false), (y, false), (z, true)]);
+    }
+
+    #[test]
+    fn empty_observation_set_produces_no_new_projected_state() {
+        let mut ts = Transys::default();
+        let hidden = ts.new_var();
+        ts.add_latch(hidden, None, !hidden.lit());
+        check_projected_successors(&ts, &[]);
     }
 }

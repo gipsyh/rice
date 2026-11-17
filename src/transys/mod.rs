@@ -37,6 +37,11 @@ pub trait TransysIf {
 
     fn latch(&self) -> impl Iterator<Item = Var>;
 
+    #[inline]
+    fn max_leaf_var(&self) -> Var {
+        self.input().chain(self.latch()).max().unwrap_or(Var::CONST)
+    }
+
     fn is_latch(&self, _v: Var) -> bool {
         panic!("Error: is_latch not support");
     }

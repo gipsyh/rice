@@ -1,11 +1,10 @@
 use crate::transys::{Transys, TransysIf};
-use giputils::bitvec::BitVec;
 use logicrs::{Lit, Var, VarBitVec, VarMap};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 struct RandomSimulate<'t> {
     ts: &'t Transys,
-    consider: Vec<Var>,
+    latch: Vec<Var>,
     next: Vec<Lit>,
     input: Vec<Var>,
     order: Vec<Var>,
@@ -14,20 +13,21 @@ struct RandomSimulate<'t> {
 }
 
 impl<'t> RandomSimulate<'t> {
-    fn new(ts: &'t Transys, consider: &[Var]) -> Self {
+    fn new(ts: &'t Transys) -> Self {
+        let latch: Vec<_> = ts.latch().collect();
         let mut seen = VarMap::new_with(ts.max_var());
         seen[Var::CONST] = true;
-        for &v in consider {
+        for &v in &latch {
             seen[v] = true;
         }
         let mut input = Vec::new();
-        for v in ts.input().chain(ts.latch()) {
+        for v in ts.input() {
             if !seen[v] {
                 seen[v] = true;
                 input.push(v);
             }
         }
-        let next: Vec<_> = consider.iter().map(|&v| ts.next(v.lit())).collect();
+        let next: Vec<_> = latch.iter().map(|&v| ts.next(v.lit())).collect();
         // Build only the combinational cones of the observed next functions.
         // All inputs and registers terminate traversal as state or random leaves.
         let mut order = Vec::new();
@@ -52,7 +52,7 @@ impl<'t> RandomSimulate<'t> {
         }
         let mut rng = StdRng::seed_from_u64(0);
         let mut value = VarMap::new_with(ts.max_var());
-        for &v in consider {
+        for &v in &latch {
             value[v] = match ts.init(v).and_then(|init| init.try_constant()) {
                 Some(true) => u64::MAX,
                 Some(false) => 0,
@@ -61,7 +61,7 @@ impl<'t> RandomSimulate<'t> {
         }
         Self {
             ts,
-            consider: consider.to_vec(),
+            latch,
             next,
             input,
             order,
@@ -79,7 +79,7 @@ impl<'t> RandomSimulate<'t> {
     }
 
     fn step(&mut self, next: &mut [u64]) {
-        // Each unobserved register is an independent fresh input each cycle.
+        // Refresh primary inputs and other free leaves for every step.
         for &v in &self.input {
             self.value[v] = self.rng.random::<u64>();
         }
@@ -102,7 +102,7 @@ impl<'t> RandomSimulate<'t> {
         for (slot, &lit) in next.iter_mut().zip(&self.next) {
             *slot = self.lit_value(lit);
         }
-        for (&v, &next) in self.consider.iter().zip(next.iter()) {
+        for (&v, &next) in self.latch.iter().zip(next.iter()) {
             self.value[v] = next;
         }
     }
@@ -110,10 +110,10 @@ impl<'t> RandomSimulate<'t> {
 
 impl Transys {
     /// Store num_word words for registers with constant initial values.
-    /// The first word contains self.init and 63 successive random-input steps.
-    /// Later words advance these 64 states in parallel with fresh random inputs,
+    /// The first word contains 64 states satisfying the constant initial values.
+    /// Other registers start with independent random values in each lane.
+    /// Later words advance these 64 complete states with fresh random inputs,
     /// using a DFS evaluation order built once for the required next-state cones.
-    /// Registers outside the observed set are randomized independently each step.
     /// Constraints are ignored during sampling.
     pub fn random_rt_simulation(&self, num_word: usize) -> VarBitVec {
         let mut sim = VarBitVec::new();
@@ -125,18 +125,8 @@ impl Transys {
             .latch()
             .filter(|&v| self.init(v).and_then(|init| init.try_constant()).is_some())
             .collect();
-        let mut run = RandomSimulate::new(self, &consider);
-        let mut next = vec![0; consider.len()];
-        let mut first_word: Vec<_> = consider.iter().map(|&v| run.value[v] & 1).collect();
-        for bit in 1..BitVec::WORD_SIZE {
-            run.step(&mut next);
-            for (&v, word) in consider.iter().zip(&mut first_word) {
-                *word |= (run.value[v] & 1) << bit;
-            }
-        }
-        for (&v, &word) in consider.iter().zip(&first_word) {
-            run.value[v] = word;
-        }
+        let mut run = RandomSimulate::new(self);
+        let mut next = vec![0; run.latch.len()];
         for word in 0..num_word {
             if word > 0 {
                 run.step(&mut next);
@@ -152,6 +142,7 @@ impl Transys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use giputils::bitvec::BitVec;
     use logicrs::{Lit, LitVec, satif::Satif};
 
     #[test]
@@ -181,14 +172,12 @@ mod tests {
             }
             assert!(samples[Var::CONST].is_zero());
             for &(v, value) in &initial {
-                assert_eq!(samples[v].get(0), value);
+                for lane in 0..BitVec::WORD_SIZE {
+                    assert_eq!(samples[v].get(lane), value);
+                }
             }
-            for index in 1..samples.bv_len() {
-                let from = if index < BitVec::WORD_SIZE {
-                    index - 1
-                } else {
-                    index - BitVec::WORD_SIZE
-                };
+            for index in BitVec::WORD_SIZE..samples.bv_len() {
+                let from = index - BitVec::WORD_SIZE;
                 let next: Vec<_> = initial
                     .iter()
                     .map(|&(v, _)| samples[v].get(index))
@@ -209,14 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn random_dfs_treats_unobserved_registers_as_fresh_inputs() {
+    fn random_dfs_preserves_independently_initialized_hidden_state() {
         let mut ts = Transys::default();
         let observed = ts.new_var();
         let hidden = ts.new_var();
         let unrelated = ts.new_var();
         let inverted = ts.new_var();
         ts.add_latch(observed, Some(Lit::FALSE), hidden.lit());
-        ts.add_latch(hidden, None, !hidden.lit());
+        ts.add_latch(hidden, None, hidden.lit());
         ts.add_latch(unrelated, None, unrelated.lit());
         ts.add_latch(inverted, Some(Lit::TRUE), !hidden.lit());
         let samples = ts.random_rt_simulation(7);
@@ -224,25 +213,26 @@ mod tests {
         assert_eq!(samples[observed], repeated[observed]);
         assert!(samples[hidden].is_empty());
         assert!(samples[unrelated].is_empty());
-        assert!(!samples[observed].is_zero());
-        assert!(!samples[observed].is_ones());
-        assert!(!samples[observed].get(0));
+        let first_successors = samples[observed].slice(BitVec::WORD_SIZE..2 * BitVec::WORD_SIZE);
+        assert!(!first_successors.is_zero());
+        assert!(!first_successors.is_ones());
         for index in 0..samples.bv_len() {
             assert_ne!(samples[observed].get(index), samples[inverted].get(index));
         }
-        ts.next.insert(hidden, Lit::FALSE);
-        ts.next.insert(unrelated, Lit::TRUE);
-        let changed_next = ts.random_rt_simulation(7);
-        assert_eq!(samples[observed], changed_next[observed]);
-        assert_eq!(samples[inverted], changed_next[inverted]);
-
-        ts.input.push(hidden);
-        ts.latch.retain(|&v| v != hidden);
-        ts.next.remove(&hidden);
-        let as_input = ts.random_rt_simulation(7);
-        for v in [observed, inverted] {
-            assert_eq!(samples[v], as_input[v]);
+        for index in 2 * BitVec::WORD_SIZE..samples.bv_len() {
+            assert_eq!(
+                samples[observed].get(index),
+                samples[observed].get(index - BitVec::WORD_SIZE)
+            );
         }
+        ts.next.insert(hidden, Lit::FALSE);
+        let changed_next = ts.random_rt_simulation(7);
+        assert!(
+            changed_next[observed]
+                .slice(2 * BitVec::WORD_SIZE..changed_next.bv_len())
+                .is_zero()
+        );
+        assert_ne!(samples[observed], changed_next[observed]);
     }
 
     #[test]
